@@ -19,7 +19,20 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from pptx import Presentation
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # Отключаем логи
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    server.serve_forever()
 # ─── Настройки ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
@@ -630,6 +643,7 @@ async def handle_text(message: Message):
 async def main():
     init_db()
     logger.info("Бот запускается...")
+    threading.Thread(target=run_health_server, daemon=True).start()
     await dp.start_polling(bot)
 
 

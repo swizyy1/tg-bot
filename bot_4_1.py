@@ -4,8 +4,10 @@ import io
 import logging
 import os
 import sqlite3
+import threading
 import urllib.parse
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
 import openpyxl
@@ -19,20 +21,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from pptx import Presentation
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass  # Отключаем логи
-
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
-    server.serve_forever()
 # ─── Настройки ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
@@ -56,6 +45,20 @@ else:
 
 dp = Dispatcher()
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# ─── Health-сервер для Render ─────────────────────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # Отключаем логи
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    server.serve_forever()
+
 
 SYSTEM_PROMPT = """Ты умный AI-ассистент в Telegram с расширенными возможностями.
 
@@ -642,8 +645,8 @@ async def handle_text(message: Message):
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 async def main():
     init_db()
-    logger.info("Бот запускается...")
     threading.Thread(target=run_health_server, daemon=True).start()
+    logger.info("Бот запускается...")
     await dp.start_polling(bot)
 
 

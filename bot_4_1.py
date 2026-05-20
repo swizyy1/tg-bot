@@ -3,7 +3,9 @@ import base64
 import io
 import logging
 import os
+import sqlite3
 import urllib.parse
+from datetime import datetime, timedelta
 
 import aiohttp
 import openpyxl
@@ -11,14 +13,23 @@ from anthropic import AsyncAnthropic
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import (
+    Message, BufferedInputFile,
+    LabeledPrice, PreCheckoutQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from pptx import Presentation
-from pptx.util import Inches, Pt
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 PROXY_URL = os.getenv("PROXY_URL", "")
+
+# Цена подписки в Telegram Stars (1 Star ≈ 0.013$, 250 Stars ≈ ~3$)
+SUBSCRIPTION_PRICE_STARS = 250
+SUBSCRIPTION_DAYS = 30
+FREE_MESSAGES_PER_DAY = 10
+MAX_HISTORY = 20  # последних сообщений хранить в истории
 
 # ─── Инициализация ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -27,15 +38,11 @@ logger = logging.getLogger(__name__)
 if PROXY_URL:
     session = AiohttpSession(proxy=PROXY_URL)
     bot = Bot(token=TELEGRAM_TOKEN, session=session)
-    logger.info(f"Используется прокси: {PROXY_URL}")
 else:
     bot = Bot(token=TELEGRAM_TOKEN)
 
 dp = Dispatcher()
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-
-conversation_history: dict[int, list[dict]] = {}
-MAX_HISTORY = 20
 
 SYSTEM_PROMPT = """Ты умный AI-ассистент в Telegram с расширенными возможностями.
 
@@ -63,6 +70,195 @@ TITLE:Название презентации
 SLIDE:Заголовок слайда|Текст содержимого слайда
 SLIDE:Заголовок 2|Текст 2
 """
+
+
+# ─── База данных ──────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+
+    # Пользователи и подписки
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            created_at TEXT,
+            subscription_until TEXT,
+            messages_today INTEGER DEFAULT 0,
+            last_message_date TEXT
+        )
+    """)
+
+    # История сообщений (сохраняется между сессиями)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS message_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            role TEXT,
+            content TEXT,
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def get_user(user_id: int) -> dict | None:
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "user_id": row[0],
+            "username": row[1],
+            "created_at": row[2],
+            "subscription_until": row[3],
+            "messages_today": row[4],
+            "last_message_date": row[5],
+        }
+    return None
+
+
+def create_user(user_id: int, username: str):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, created_at, messages_today, last_message_date) VALUES (?, ?, ?, 0, ?)",
+        (user_id, username, now, datetime.now().date().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_subscribed(user_id: int) -> bool:
+    user = get_user(user_id)
+    if not user or not user["subscription_until"]:
+        return False
+    until = datetime.fromisoformat(user["subscription_until"])
+    return until > datetime.now()
+
+
+def get_subscription_until(user_id: int) -> str | None:
+    user = get_user(user_id)
+    if not user or not user["subscription_until"]:
+        return None
+    until = datetime.fromisoformat(user["subscription_until"])
+    if until > datetime.now():
+        return until.strftime("%d.%m.%Y")
+    return None
+
+
+def activate_subscription(user_id: int):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    user = get_user(user_id)
+    if user and user["subscription_until"]:
+        current = datetime.fromisoformat(user["subscription_until"])
+        if current > datetime.now():
+            new_until = current + timedelta(days=SUBSCRIPTION_DAYS)
+        else:
+            new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
+    else:
+        new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
+    c.execute(
+        "UPDATE users SET subscription_until = ? WHERE user_id = ?",
+        (new_until.isoformat(), user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def can_send_message(user_id: int) -> tuple[bool, int]:
+    """Возвращает (может ли отправить, осталось сообщений)"""
+    if is_subscribed(user_id):
+        return True, -1  # -1 = безлимит
+
+    user = get_user(user_id)
+    if not user:
+        return False, 0
+
+    today = datetime.now().date().isoformat()
+    if user["last_message_date"] != today:
+        # Новый день — сбрасываем счётчик
+        conn = sqlite3.connect("bot.db")
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET messages_today = 0, last_message_date = ? WHERE user_id = ?",
+            (today, user_id)
+        )
+        conn.commit()
+        conn.close()
+        return True, FREE_MESSAGES_PER_DAY
+
+    remaining = FREE_MESSAGES_PER_DAY - user["messages_today"]
+    return remaining > 0, max(0, remaining)
+
+
+def increment_message_count(user_id: int):
+    today = datetime.now().date().isoformat()
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET messages_today = messages_today + 1, last_message_date = ? WHERE user_id = ?",
+        (today, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+# ─── История сообщений (персистентная) ───────────────────────────────────────
+def load_history(user_id: int) -> list[dict]:
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, content FROM message_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, MAX_HISTORY)
+    )
+    rows = c.fetchall()
+    conn.close()
+    # Возвращаем в правильном порядке (старые сначала)
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+
+def save_message(user_id: int, role: str, content: str):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute(
+        "INSERT INTO message_history (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, role, content if isinstance(content, str) else str(content), now)
+    )
+    # Удаляем старые сообщения, оставляем только MAX_HISTORY*2
+    c.execute("""
+        DELETE FROM message_history WHERE id IN (
+            SELECT id FROM message_history WHERE user_id = ?
+            ORDER BY id DESC LIMIT -1 OFFSET ?
+        )
+    """, (user_id, MAX_HISTORY * 2))
+    conn.commit()
+    conn.close()
+
+
+def clear_history(user_id: int):
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM message_history WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+# ─── Клавиатура для подписки ──────────────────────────────────────────────────
+def subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"⭐ Купить подписку ({SUBSCRIPTION_PRICE_STARS} Stars / месяц)",
+            callback_data="buy_subscription"
+        )
+    ]])
 
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
@@ -184,32 +380,39 @@ def create_presentation(text: str) -> bytes | None:
 
 
 async def ask_claude(user_id: int, content) -> str:
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-
-    conversation_history[user_id].append({"role": "user", "content": content})
-
-    if len(conversation_history[user_id]) > MAX_HISTORY:
-        conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY:]
+    history = load_history(user_id)
+    content_str = content if isinstance(content, str) else "[фото]"
+    history.append({"role": "user", "content": content})
 
     response = await anthropic.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=2048,
         system=SYSTEM_PROMPT,
-        messages=conversation_history[user_id]
+        messages=history
     )
 
     reply = response.content[0].text
-    conversation_history[user_id].append({"role": "assistant", "content": reply})
+
+    # Сохраняем в БД (только текстовые сообщения)
+    save_message(user_id, "user", content_str)
+    save_message(user_id, "assistant", reply)
+
     return reply
 
 
 # ─── Хэндлеры ─────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    conversation_history[message.from_user.id] = []
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    create_user(user_id, username)
+
+    sub_until = get_subscription_until(user_id)
+    sub_text = f"✅ Подписка активна до {sub_until}" if sub_until else f"🆓 Бесплатно: {FREE_MESSAGES_PER_DAY} сообщений/день"
+
     await message.answer(
-        "👋 Привет! Я AI-ассистент на базе Claude.\n\n"
+        f"👋 Привет, {username}! Я AI-ассистент на базе Claude.\n\n"
+        f"{sub_text}\n\n"
         "🔧 Я умею:\n"
         "• 💬 Отвечать на вопросы\n"
         "• 🖼 Распознавать картинки и решать задачи с фото\n"
@@ -219,14 +422,48 @@ async def cmd_start(message: Message):
         "📌 Команды:\n"
         "/start — начать заново\n"
         "/clear — очистить историю\n"
+        "/subscribe — купить подписку\n"
+        "/status — статус подписки\n"
         "/help — примеры запросов"
     )
 
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
-    conversation_history[message.from_user.id] = []
+    clear_history(message.from_user.id)
     await message.answer("🗑️ История очищена!")
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    user_id = message.from_user.id
+    sub_until = get_subscription_until(user_id)
+
+    if sub_until:
+        await message.answer(f"✅ Подписка активна до {sub_until}\n\nБез ограничений на сообщения!")
+    else:
+        can, remaining = can_send_message(user_id)
+        await message.answer(
+            f"🆓 Бесплатный план\n"
+            f"Осталось сообщений сегодня: {remaining}/{FREE_MESSAGES_PER_DAY}\n\n"
+            f"Купи подписку для безлимитного доступа!",
+            reply_markup=subscription_keyboard()
+        )
+
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    sub_until = get_subscription_until(message.from_user.id)
+    extra = f"\nТвоя подписка будет продлена до следующего месяца от {sub_until}." if sub_until else ""
+
+    await message.answer(
+        f"⭐ Подписка на AI-ассистента\n\n"
+        f"• Безлимитные сообщения\n"
+        f"• История диалогов сохраняется\n"
+        f"• Все функции без ограничений\n\n"
+        f"Цена: {SUBSCRIPTION_PRICE_STARS} Telegram Stars / месяц{extra}",
+        reply_markup=subscription_keyboard()
+    )
 
 
 @dp.message(Command("help"))
@@ -244,8 +481,71 @@ async def cmd_help(message: Message):
     )
 
 
+# ─── Оплата через Telegram Stars ──────────────────────────────────────────────
+@dp.callback_query(F.data == "buy_subscription")
+async def process_buy(callback):
+    await callback.answer()
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="Подписка на AI-ассистента",
+        description=f"Безлимитный доступ на {SUBSCRIPTION_DAYS} дней. История сообщений сохраняется.",
+        payload="subscription_1month",
+        currency="XTR",  # Telegram Stars
+        prices=[LabeledPrice(label="Подписка 1 месяц", amount=SUBSCRIPTION_PRICE_STARS)],
+    )
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    user_id = message.from_user.id
+    activate_subscription(user_id)
+    until = get_subscription_until(user_id)
+    await message.answer(
+        f"🎉 Оплата прошла успешно!\n\n"
+        f"✅ Подписка активна до {until}\n\n"
+        f"Теперь у тебя безлимитный доступ ко всем функциям!"
+    )
+
+
+# ─── Проверка лимитов ──────────────────────────────────────────────────────────
+async def check_limits(message: Message) -> bool:
+    """Возвращает True если пользователь может отправить сообщение"""
+    user_id = message.from_user.id
+    create_user(user_id, message.from_user.username or message.from_user.first_name)
+
+    can, remaining = can_send_message(user_id)
+
+    if not can:
+        await message.answer(
+            f"⛔ Ты израсходовал лимит бесплатных сообщений на сегодня ({FREE_MESSAGES_PER_DAY} шт.)\n\n"
+            f"Лимит обновится завтра, или купи подписку для безлимитного доступа!",
+            reply_markup=subscription_keyboard()
+        )
+        return False
+
+    if not is_subscribed(user_id) and remaining <= 3:
+        await message.answer(
+            f"⚠️ Осталось {remaining} бесплатных сообщений на сегодня.",
+            reply_markup=subscription_keyboard()
+        )
+
+    if not is_subscribed(user_id):
+        increment_message_count(user_id)
+
+    return True
+
+
+# ─── Обработчики сообщений ────────────────────────────────────────────────────
 @dp.message(F.photo)
 async def handle_photo(message: Message):
+    if not await check_limits(message):
+        return
+
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         photo = message.photo[-1]
@@ -272,6 +572,9 @@ async def handle_photo(message: Message):
 
 @dp.message(F.text)
 async def handle_text(message: Message):
+    if not await check_limits(message):
+        return
+
     user_id = message.from_user.id
     text = message.text
 
@@ -325,6 +628,7 @@ async def handle_text(message: Message):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 async def main():
+    init_db()
     logger.info("Бот запускается...")
     await dp.start_polling(bot)
 

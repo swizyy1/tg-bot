@@ -31,8 +31,8 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 SUBSCRIPTION_PRICE_STARS = 250
 SUBSCRIPTION_DAYS = 30
 FREE_MESSAGES_PER_DAY = 10
-ADMIN_IDS = [1175196102]  
 MAX_HISTORY = 20  # последних сообщений хранить в истории
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x and x != "0"]
 
 # ─── Инициализация ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -57,8 +57,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass  # Отключаем логи
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
     server.serve_forever()
 
 
@@ -499,6 +498,69 @@ async def cmd_help(message: Message):
     )
 
 
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У тебя нет доступа к этой команде.")
+        return
+
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+
+    # Всего пользователей
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+
+    # Активных сегодня
+    today = datetime.now().date().isoformat()
+    c.execute("SELECT COUNT(*) FROM users WHERE last_message_date = ?", (today,))
+    active_today = c.fetchone()[0]
+
+    # Платящих подписчиков
+    now = datetime.now().isoformat()
+    c.execute("SELECT COUNT(*) FROM users WHERE subscription_until > ?", (now,))
+    subscribers = c.fetchone()[0]
+
+    # Новых пользователей за последние 7 дней
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    c.execute("SELECT COUNT(*) FROM users WHERE created_at > ?", (week_ago,))
+    new_week = c.fetchone()[0]
+
+    # Топ 5 активных пользователей
+    c.execute("""
+        SELECT username, messages_today FROM users
+        ORDER BY messages_today DESC LIMIT 5
+    """)
+    top_users = c.fetchall()
+
+    # Подписчики — список
+    c.execute("""
+        SELECT username, subscription_until FROM users
+        WHERE subscription_until > ?
+        ORDER BY subscription_until DESC
+    """, (now,))
+    sub_list = c.fetchall()
+
+    conn.close()
+
+    top_text = "\n".join([f"  • {u[0] or 'unknown'} — {u[1]} сообщ." for u in top_users]) or "нет данных"
+    sub_text = "\n".join([
+        f"  • {u[0] or 'unknown'} до {datetime.fromisoformat(u[1]).strftime('%d.%m.%Y')}"
+        for u in sub_list
+    ]) or "нет подписчиков"
+
+    await message.answer(
+        f"📊 Админ-панель NeuroBot\n"
+        f"{'─' * 30}\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"🟢 Активных сегодня: {active_today}\n"
+        f"🆕 Новых за 7 дней: {new_week}\n"
+        f"💎 Подписчиков: {subscribers}\n\n"
+        f"🏆 Топ активных сегодня:\n{top_text}\n\n"
+        f"💳 Подписчики:\n{sub_text}"
+    )
+
+
 # ─── Оплата через Telegram Stars ──────────────────────────────────────────────
 @dp.callback_query(F.data == "buy_subscription")
 async def process_buy(callback):
@@ -523,11 +585,23 @@ async def successful_payment(message: Message):
     user_id = message.from_user.id
     activate_subscription(user_id)
     until = get_subscription_until(user_id)
+    username = message.from_user.username or message.from_user.first_name
     await message.answer(
         f"🎉 Оплата прошла успешно!\n\n"
         f"✅ Подписка активна до {until}\n\n"
         f"Теперь у тебя безлимитный доступ ко всем функциям!"
     )
+    # Уведомление админу
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"💰 Новая оплата!\n\n"
+                f"👤 Пользователь: @{username}\n"
+                f"📅 Подписка до: {until}"
+            )
+        except Exception:
+            pass
 
 
 # ─── Проверка лимитов ──────────────────────────────────────────────────────────

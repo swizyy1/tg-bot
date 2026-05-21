@@ -317,7 +317,19 @@ async def wolfram_calculate(query: str) -> str | None:
     if not WOLFRAM_API_KEY:
         return None
     try:
-        encoded = urllib.parse.quote(query)
+        # Переводим запрос на английский через Claude
+        translation_response = await anthropic.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": f"Переведи этот математический запрос на английский язык для WolframAlpha. Верни ТОЛЬКО перевод без пояснений: {query}"
+            }]
+        )
+        english_query = translation_response.content[0].text.strip()
+        logger.info(f"WolframAlpha запрос: {english_query}")
+
+        encoded = urllib.parse.quote(english_query)
         url = f"http://api.wolframalpha.com/v1/result?appid={WOLFRAM_API_KEY}&i={encoded}&units=metric"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:

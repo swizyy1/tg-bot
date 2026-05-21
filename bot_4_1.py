@@ -696,7 +696,7 @@ async def handle_photo(message: Message):
         photo_bytes = buf.getvalue()
 
         photo_b64 = base64.standard_b64encode(photo_bytes).decode()
-        caption = message.caption or "Что на этом изображении? Опиши подробно. Если это задача или уравнение — реши его."
+        caption = message.caption or "Если на фото математическая или геометрическая задача — реши её строго пошагово, записывая все формулы и промежуточные вычисления. Проверь ответ в конце. Если это не задача — опиши что на изображении."
 
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": photo_b64}},

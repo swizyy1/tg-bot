@@ -31,6 +31,7 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 SUBSCRIPTION_PRICE_STARS = 250
 SUBSCRIPTION_DAYS = 30
 FREE_MESSAGES_PER_DAY = 10
+ADMIN_IDS = [1175196102]  
 MAX_HISTORY = 20  # последних сообщений хранить в истории
 
 # ─── Инициализация ────────────────────────────────────────────────────────────
@@ -532,6 +533,8 @@ async def successful_payment(message: Message):
 # ─── Проверка лимитов ──────────────────────────────────────────────────────────
 async def check_limits(message: Message) -> bool:
     """Возвращает True если пользователь может отправить сообщение"""
+    if message.from_user.id in ADMIN_IDS:
+        return True  # админ без лимитов
     user_id = message.from_user.id
     create_user(user_id, message.from_user.username or message.from_user.first_name)
 

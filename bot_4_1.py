@@ -722,6 +722,19 @@ async def handle_text(message: Message):
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
+        # Определяем что пользователь недоволен ответом
+        retry_keywords = [
+            "неправильно", "неверно", "ошибка", "ошибся", "не так",
+            "перерешай", "попробуй снова", "попробуй ещё", "реши заново",
+            "wrong", "incorrect", "try again", "redo", "mistake"
+        ]
+        if any(kw in text.lower() for kw in retry_keywords):
+            clear_history(user_id)
+            await message.answer(
+                "🔄 Понял, давай попробуем заново с чистого листа!\n\n"
+                "Пришли задачу ещё раз — решу пошагово и аккуратно."
+            )
+            return
         if is_image_request(text):
             await message.answer("🎨 Генерирую изображение, подожди 10-20 секунд...")
             await bot.send_chat_action(message.chat.id, "upload_photo")

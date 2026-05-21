@@ -26,6 +26,7 @@ from pptx import Presentation
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 PROXY_URL = os.getenv("PROXY_URL", "")
+WOLFRAM_API_KEY = os.getenv("WOLFRAM_API_KEY", "")
 
 # Цена подписки в Telegram Stars (1 Star ≈ 0.013$, 250 Stars ≈ ~3$)
 SUBSCRIPTION_PRICE_STARS = 250
@@ -72,6 +73,14 @@ SYSTEM_PROMPT = """Ты умный AI-ассистент в Telegram с расш
 - Распознавать и анализировать картинки
 - Создавать Excel таблицы
 - Создавать презентации PowerPoint
+- Точно решать математические задачи
+
+При решении математических и геометрических задач:
+1. Всегда решай строго пошагово
+2. Записывай все формулы которые используешь
+3. Подставляй числа явно на каждом шаге
+4. В конце проверяй ответ подстановкой
+5. Если задача геометрическая — сначала опиши фигуру и все известные элементы
 
 Если пользователь пишет на русском — отвечай на русском.
 если на английском — на английском.
@@ -294,6 +303,32 @@ def is_excel_request(text: str) -> bool:
 def is_presentation_request(text: str) -> bool:
     keywords = ["презентацию", "powerpoint", "pptx", "слайды", "создай презентацию"]
     return any(kw in text.lower() for kw in keywords)
+
+
+def is_math_request(text: str) -> bool:
+    keywords = ["вычисли", "посчитай", "сколько будет", "реши уравнение", "решить уравнение",
+                "найди корни", "интеграл", "производная", "логарифм", "sin", "cos", "sqrt",
+                "факториал", "calculate", "solve", "integral", "derivative", "=/", "^2", "^3"]
+    return any(kw in text.lower() for kw in keywords)
+
+
+async def wolfram_calculate(query: str) -> str | None:
+    """Точное вычисление через WolframAlpha."""
+    if not WOLFRAM_API_KEY:
+        return None
+    try:
+        encoded = urllib.parse.quote(query)
+        url = f"http://api.wolframalpha.com/v1/result?appid={WOLFRAM_API_KEY}&i={encoded}&units=metric"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    result = await resp.text()
+                    return result
+                else:
+                    logger.warning(f"WolframAlpha статус: {resp.status}")
+    except Exception as e:
+        logger.error(f"WolframAlpha ошибка: {e}")
+    return None
 
 
 async def generate_image(prompt: str, retries: int = 3) -> bytes | None:
@@ -711,6 +746,20 @@ async def handle_text(message: Message):
 
             await message.answer(reply)
             return
+
+        # Пробуем WolframAlpha для точных вычислений
+        if is_math_request(text) and WOLFRAM_API_KEY:
+            wolfram_result = await wolfram_calculate(text)
+            if wolfram_result:
+                # Claude объясняет ответ WolframAlpha
+                enhanced_text = (
+                    f"{text}\n\n"
+                    f"[Точный ответ от WolframAlpha: {wolfram_result}]\n"
+                    f"Объясни решение пошагово, используя этот точный ответ."
+                )
+                reply = await ask_claude(user_id, enhanced_text)
+                await message.answer(f"🔢 *Точный ответ:* `{wolfram_result}`\n\n{reply}", parse_mode="Markdown")
+                return
 
         reply = await ask_claude(user_id, text)
         await message.answer(reply)

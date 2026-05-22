@@ -1122,7 +1122,7 @@ async def handle_photo(message: Message):
         ]
 
         reply = await ask_claude(message.from_user.id, content)
-        await message.answer(reply)
+        await send_long_message(message, reply)
 
     except Exception as e:
         logger.error(f"Ошибка обработки фото: {e}")
@@ -1207,6 +1207,17 @@ async def cmd_broadcast(message: Message):
     )
 
 
+async def send_long_message(message: Message, text: str):
+    """Отправляет длинное сообщение разбивая на части по 4096 символов."""
+    max_len = 4096
+    if len(text) <= max_len:
+        await message.answer(text)
+        return
+    parts = [text[i:i+max_len] for i in range(0, len(text), max_len)]
+    for part in parts:
+        await message.answer(part)
+
+
 @dp.message(F.text)
 async def handle_text(message: Message):
     if not await check_limits(message):
@@ -1270,25 +1281,24 @@ async def handle_text(message: Message):
                     )
                     return
 
-            await message.answer(reply)
+            await send_long_message(message, reply)
             return
 
         # Пробуем WolframAlpha для точных вычислений
         if is_math_request(text) and WOLFRAM_API_KEY:
             wolfram_result = await wolfram_calculate(text)
             if wolfram_result:
-                # Claude объясняет ответ WolframAlpha
                 enhanced_text = (
                     f"{text}\n\n"
                     f"[Точный ответ от WolframAlpha: {wolfram_result}]\n"
                     f"Объясни решение пошагово, используя этот точный ответ."
                 )
                 reply = await ask_claude(user_id, enhanced_text)
-                await message.answer(f"🔢 *Точный ответ:* `{wolfram_result}`\n\n{reply}", parse_mode="Markdown")
+                await send_long_message(message, f"🔢 Точный ответ: {wolfram_result}\n\n{reply}")
                 return
 
         reply = await ask_claude(user_id, text)
-        await message.answer(reply)
+        await send_long_message(message, reply)
 
     except Exception as e:
         logger.error(f"Ошибка: {e}")

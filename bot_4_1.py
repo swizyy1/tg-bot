@@ -131,6 +131,19 @@ async def check_yukassa_payment(payment_id: str) -> bool:
 pending_payments: dict[str, int] = {}
 
 
+def save_payment(user_id: int, username: str, payment_id: str):
+    """Сохраняем успешный платёж в БД."""
+    conn = sqlite3.connect("bot.db")
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute(
+        "INSERT INTO payments (user_id, username, amount, payment_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, username, SUBSCRIPTION_PRICE_RUB, payment_id, now)
+    )
+    conn.commit()
+    conn.close()
+
+
 async def poll_payment(payment_id: str, user_id: int):
     """Проверяем платёж каждые 30 секунд в течение 30 минут."""
     for _ in range(60):
@@ -140,6 +153,7 @@ async def poll_payment(payment_id: str, user_id: int):
             activate_subscription(user_id)
             until = get_subscription_until(user_id)
             username = (await bot.get_chat(user_id)).username or str(user_id)
+            save_payment(user_id, username, payment_id)
             try:
                 await bot.send_message(
                     user_id,
@@ -282,6 +296,18 @@ def init_db():
             user_id INTEGER,
             role TEXT,
             content TEXT,
+            created_at TEXT
+        )
+    """)
+
+    # Таблица платежей для статистики выручки
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            amount INTEGER,
+            payment_id TEXT,
             created_at TEXT
         )
     """)
@@ -1194,6 +1220,31 @@ async def cmd_admin(message: Message):
     """, (now,))
     sub_list = c.fetchall()
 
+    # Выручка за сегодня
+    c.execute(
+        "SELECT COUNT(*), SUM(amount) FROM payments WHERE created_at >= ?",
+        (datetime.now().date().isoformat(),)
+    )
+    row = c.fetchone()
+    revenue_today_count = row[0] or 0
+    revenue_today = row[1] or 0
+
+    # Выручка за этот месяц
+    month_start = datetime.now().replace(day=1).date().isoformat()
+    c.execute(
+        "SELECT COUNT(*), SUM(amount) FROM payments WHERE created_at >= ?",
+        (month_start,)
+    )
+    row = c.fetchone()
+    revenue_month_count = row[0] or 0
+    revenue_month = row[1] or 0
+
+    # Всего выручки
+    c.execute("SELECT COUNT(*), SUM(amount) FROM payments")
+    row = c.fetchone()
+    revenue_total_count = row[0] or 0
+    revenue_total = row[1] or 0
+
     conn.close()
 
     top_text = "\n".join([f"  • {u[0] or 'unknown'} — {u[1]} сообщ." for u in top_users]) or "нет данных"
@@ -1209,6 +1260,9 @@ async def cmd_admin(message: Message):
         f"🟢 Активных сегодня: {active_today}\n"
         f"🆕 Новых за 7 дней: {new_week}\n"
         f"💎 Подписчиков: {subscribers}\n\n"
+        f"💰 Выручка сегодня: {revenue_today}₽ ({revenue_today_count} платежей)\n"
+        f"📅 Выручка за месяц: {revenue_month}₽ ({revenue_month_count} платежей)\n"
+        f"🏦 Всего заработано: {revenue_total}₽ ({revenue_total_count} платежей)\n\n"
         f"🏆 Топ активных сегодня:\n{top_text}\n\n"
         f"💳 Подписчики:\n{sub_text}"
     )

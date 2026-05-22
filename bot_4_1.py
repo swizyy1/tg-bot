@@ -18,7 +18,8 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, BufferedInputFile,
     LabeledPrice, PreCheckoutQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from pptx import Presentation
 
@@ -451,6 +452,14 @@ def clear_history(user_id: int):
     conn.close()
 
 
+def bottom_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📋 Меню")]],
+        resize_keyboard=True,
+        persistent=True
+    )
+
+
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -722,8 +731,9 @@ async def cmd_start(message: Message):
         "• 📊 Создавать Excel таблицы\n"
         "• 📋 Создавать презентации PowerPoint\n\n"
         "👇 Используй меню ниже или просто напиши мне!",
-        reply_markup=main_keyboard()
+        reply_markup=bottom_menu()
     )
+    await message.answer("Открываю меню:", reply_markup=main_keyboard())
 
 
 @dp.message(Command("referral"))
@@ -1207,6 +1217,11 @@ async def handle_text(message: Message):
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
+        # Обработка кнопки меню
+        if text == "📋 Меню":
+            await message.answer("Открываю меню:", reply_markup=main_keyboard())
+            return
+
         # Определяем что пользователь недоволен ответом
         retry_keywords = [
             "неправильно", "неверно", "ошибка", "ошибся", "не так",

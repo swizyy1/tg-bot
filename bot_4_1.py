@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import urllib.parse
+import uuid
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -28,14 +29,17 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
 PROXY_URL = os.getenv("PROXY_URL", "")
 WOLFRAM_API_KEY = os.getenv("WOLFRAM_API_KEY", "")
+YUKASSA_SHOP_ID = os.getenv("YUKASSA_SHOP_ID", "")
+YUKASSA_SECRET_KEY = os.getenv("YUKASSA_SECRET_KEY", "")
 
-# Цена подписки в Telegram Stars (1 Star ≈ 0.013$, 250 Stars ≈ ~3$)
+# Цена подписки
+SUBSCRIPTION_PRICE_RUB = 299
 SUBSCRIPTION_PRICE_STARS = 250
 SUBSCRIPTION_DAYS = 30
 FREE_MESSAGES_PER_DAY = 10
 TRIAL_DAYS = 3
 DAILY_BONUS_MESSAGES = 3
-MAX_BONUS_MESSAGES = 15  # максимум накопленных бонусных сообщений
+MAX_BONUS_MESSAGES = 15
 MAX_HISTORY = 20
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x and x != "0"]
 
@@ -52,7 +56,111 @@ else:
 dp = Dispatcher()
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-# ─── Health-сервер для Render ─────────────────────────────────────────────────
+# ─── ЮKassa платежи ──────────────────────────────────────────────────────────
+async def create_yukassa_payment(user_id: int, username: str) -> dict | None:
+    """Создаём платёж в ЮKassa и возвращаем ссылку для оплаты."""
+    if not YUKASSA_SHOP_ID or not YUKASSA_SECRET_KEY:
+        return None
+    try:
+        payment_id = str(uuid.uuid4())
+        payload = {
+            "amount": {
+                "value": f"{SUBSCRIPTION_PRICE_RUB}.00",
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": f"https://t.me/{(await bot.get_me()).username}"
+            },
+            "capture": True,
+            "description": f"Подписка NeuroBot на 30 дней — @{username}",
+            "metadata": {
+                "user_id": str(user_id)
+            }
+        }
+        auth = aiohttp.BasicAuth(YUKASSA_SHOP_ID, YUKASSA_SECRET_KEY)
+        headers = {
+            "Idempotence-Key": payment_id,
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://api.yookassa.ru/v3/payments",
+                json=payload,
+                auth=auth,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return {
+                        "payment_id": data["id"],
+                        "url": data["confirmation"]["confirmation_url"]
+                    }
+                else:
+                    body = await resp.text()
+                    logger.error(f"ЮKassa ошибка: {resp.status} {body}")
+    except Exception as e:
+        logger.error(f"ЮKassa exception: {e}")
+    return None
+
+
+async def check_yukassa_payment(payment_id: str) -> bool:
+    """Проверяем статус платежа."""
+    if not YUKASSA_SHOP_ID or not YUKASSA_SECRET_KEY:
+        return False
+    try:
+        auth = aiohttp.BasicAuth(YUKASSA_SHOP_ID, YUKASSA_SECRET_KEY)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://api.yookassa.ru/v3/payments/{payment_id}",
+                auth=auth,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("status") == "succeeded"
+    except Exception as e:
+        logger.error(f"ЮKassa check error: {e}")
+    return False
+
+
+# Хранилище ожидающих платежей {payment_id: user_id}
+pending_payments: dict[str, int] = {}
+
+
+async def poll_payment(payment_id: str, user_id: int):
+    """Проверяем платёж каждые 30 секунд в течение 30 минут."""
+    for _ in range(60):
+        await asyncio.sleep(30)
+        paid = await check_yukassa_payment(payment_id)
+        if paid:
+            activate_subscription(user_id)
+            until = get_subscription_until(user_id)
+            username = (await bot.get_chat(user_id)).username or str(user_id)
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🎉 Оплата прошла успешно!\n\n"
+                    f"✅ Подписка активна до {until}\n\n"
+                    f"Теперь у тебя безлимитный доступ ко всем функциям!"
+                )
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"💰 Новая оплата!\n\n"
+                            f"👤 Пользователь: @{username}\n"
+                            f"💵 Сумма: {SUBSCRIPTION_PRICE_RUB}₽\n"
+                            f"📅 Подписка до: {until}"
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"Ошибка уведомления об оплате: {e}")
+            pending_payments.pop(payment_id, None)
+            return
+    pending_payments.pop(payment_id, None)
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -1018,47 +1126,35 @@ async def cmd_admin(message: Message):
     )
 
 
-# ─── Оплата через Telegram Stars ──────────────────────────────────────────────
+# ─── Оплата через ЮKassa ──────────────────────────────────────────────────────
 @dp.callback_query(F.data == "buy_subscription")
 async def process_buy(callback):
     await callback.answer()
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title="Подписка на AI-ассистента",
-        description=f"Безлимитный доступ на {SUBSCRIPTION_DAYS} дней. История сообщений сохраняется.",
-        payload="subscription_1month",
-        currency="XTR",  # Telegram Stars
-        prices=[LabeledPrice(label="Подписка 1 месяц", amount=SUBSCRIPTION_PRICE_STARS)],
-    )
+    user_id = callback.from_user.id
+    username = callback.from_user.username or callback.from_user.first_name
 
+    await callback.message.answer("⏳ Создаю ссылку для оплаты...")
 
-@dp.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-
-@dp.message(F.successful_payment)
-async def successful_payment(message: Message):
-    user_id = message.from_user.id
-    activate_subscription(user_id)
-    until = get_subscription_until(user_id)
-    username = message.from_user.username or message.from_user.first_name
-    await message.answer(
-        f"🎉 Оплата прошла успешно!\n\n"
-        f"✅ Подписка активна до {until}\n\n"
-        f"Теперь у тебя безлимитный доступ ко всем функциям!"
-    )
-    # Уведомление админу
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"💰 Новая оплата!\n\n"
-                f"👤 Пользователь: @{username}\n"
-                f"📅 Подписка до: {until}"
+    payment = await create_yukassa_payment(user_id, username)
+    if payment:
+        pending_payments[payment["payment_id"]] = user_id
+        pay_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"💳 Оплатить {SUBSCRIPTION_PRICE_RUB}₽",
+                url=payment["url"]
             )
-        except Exception:
-            pass
+        ]])
+        await callback.message.answer(
+            f"💳 Подписка NeuroBot — {SUBSCRIPTION_PRICE_RUB}₽/месяц\n\n"
+            f"Нажми кнопку ниже для оплаты. После оплаты подписка активируется автоматически в течение минуты!",
+            reply_markup=pay_keyboard
+        )
+        # Запускаем проверку платежа в фоне
+        asyncio.create_task(poll_payment(payment["payment_id"], user_id))
+    else:
+        await callback.message.answer(
+            "❌ Не удалось создать ссылку для оплаты. Попробуй позже или напиши администратору."
+        )
 
 
 # ─── Проверка лимитов ──────────────────────────────────────────────────────────

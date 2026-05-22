@@ -281,7 +281,7 @@ def clear_history(user_id: int):
 def subscription_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text=f"⭐ Купить подписку ({SUBSCRIPTION_PRICE_STARS} Stars / месяц)",
+            text="💳 Купить подписку — 299₽ / месяц",
             callback_data="buy_subscription"
         )
     ]])
@@ -521,11 +521,13 @@ async def cmd_subscribe(message: Message):
     extra = f"\nТвоя подписка будет продлена до следующего месяца от {sub_until}." if sub_until else ""
 
     await message.answer(
-        f"⭐ Подписка на AI-ассистента\n\n"
+        f"💳 Подписка на NeuroBot\n\n"
         f"• Безлимитные сообщения\n"
         f"• История диалогов сохраняется\n"
+        f"• Генерация картинок без ограничений\n"
+        f"• Решение задач с фото\n"
         f"• Все функции без ограничений\n\n"
-        f"Цена: {SUBSCRIPTION_PRICE_STARS} Telegram Stars / месяц{extra}",
+        f"💰 Цена: 299₽ / месяц{extra}",
         reply_markup=subscription_keyboard()
     )
 

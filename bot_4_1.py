@@ -730,6 +730,7 @@ async def cmd_start(message: Message):
         "• 🎨 Генерировать изображения по описанию\n"
         "• 📊 Создавать Excel таблицы\n"
         "• 📋 Создавать презентации PowerPoint\n\n"
+        "📢 Следи за обновлениями: @NeuroBot_Info\n\n"
         "👇 Используй меню ниже или просто напиши мне!",
         reply_markup=bottom_menu()
     )

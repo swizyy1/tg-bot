@@ -3,7 +3,6 @@ import base64
 import io
 import logging
 import os
-import sqlite3
 import threading
 import urllib.parse
 import uuid
@@ -11,6 +10,7 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
+import asyncpg
 import openpyxl
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -150,10 +150,10 @@ async def poll_payment(payment_id: str, user_id: int):
         await asyncio.sleep(30)
         paid = await check_yukassa_payment(payment_id)
         if paid:
-            activate_subscription(user_id)
-            until = get_subscription_until(user_id)
+            await activate_subscription(user_id)
+            until = await get_subscription_until(user_id)
             username = (await bot.get_chat(user_id)).username or str(user_id)
-            save_payment(user_id, username, payment_id)
+            await save_payment(user_id, username, payment_id)
             try:
                 await bot.send_message(
                     user_id,
@@ -249,248 +249,132 @@ STYLE_NAMES = {
 }
 
 
-def get_system_prompt(user_id: int) -> str:
-    style = get_user_style(user_id)
+async def get_system_prompt(user_id: int) -> str:
+    style = await get_user_style(user_id)
     style_text = STYLE_PROMPTS.get(style, STYLE_PROMPTS["friend"])
     return SYSTEM_PROMPT_BASE + "\n" + style_text
 
 
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+db_pool = None
+
+
+async def get_db():
+    return db_pool
+
+
 # ─── База данных ──────────────────────────────────────────────────────────────
-def init_db():
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
 
-    # Пользователи и подписки
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            created_at TEXT,
-            subscription_until TEXT,
-            messages_today INTEGER DEFAULT 0,
-            last_message_date TEXT,
-            referred_by INTEGER DEFAULT NULL,
-            referral_count INTEGER DEFAULT 0,
-            notified_expiry INTEGER DEFAULT 0,
-            trial_used INTEGER DEFAULT 0,
-            bonus_messages INTEGER DEFAULT 0,
-            last_bonus_date TEXT
-        )
-    """)
-
-    # Добавляем колонки если их нет (для существующих БД)
-    for col in ["referred_by INTEGER DEFAULT NULL",
-                "referral_count INTEGER DEFAULT 0",
-                "notified_expiry INTEGER DEFAULT 0",
-                "trial_used INTEGER DEFAULT 0",
-                "bonus_messages INTEGER DEFAULT 0",
-                "last_bonus_date TEXT",
-                "speech_style TEXT DEFAULT 'friend'"]:
-        try:
-            c.execute(f"ALTER TABLE users ADD COLUMN {col}")
-        except Exception:
-            pass
-
-    # История сообщений (сохраняется между сессиями)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS message_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            role TEXT,
-            content TEXT,
-            created_at TEXT
-        )
-    """)
-
-    # Таблица платежей для статистики выручки
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            amount INTEGER,
-            payment_id TEXT,
-            created_at TEXT
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                created_at TEXT,
+                subscription_until TEXT,
+                messages_today INTEGER DEFAULT 0,
+                last_message_date TEXT,
+                referred_by BIGINT DEFAULT NULL,
+                referral_count INTEGER DEFAULT 0,
+                notified_expiry INTEGER DEFAULT 0,
+                trial_used INTEGER DEFAULT 0,
+                bonus_messages INTEGER DEFAULT 0,
+                last_bonus_date TEXT,
+                speech_style TEXT DEFAULT 'friend'
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_history (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                role TEXT,
+                content TEXT,
+                created_at TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                username TEXT,
+                amount INTEGER,
+                payment_id TEXT,
+                created_at TEXT
+            )
+        """)
 
 
-def get_user(user_id: int) -> dict | None:
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "user_id": row[0],
-            "username": row[1],
-            "created_at": row[2],
-            "subscription_until": row[3],
-            "messages_today": row[4],
-            "last_message_date": row[5],
-            "referred_by": row[6] if len(row) > 6 else None,
-            "referral_count": row[7] if len(row) > 7 else 0,
-            "notified_expiry": row[8] if len(row) > 8 else 0,
-            "trial_used": row[9] if len(row) > 9 else 0,
-            "bonus_messages": row[10] if len(row) > 10 else 0,
-            "last_bonus_date": row[11] if len(row) > 11 else None,
-        }
-    return None
+async def get_user(user_id: int) -> dict | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+        if row:
+            return dict(row)
+        return None
 
 
-def create_user(user_id: int, username: str, referred_by: int = None):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, created_at, messages_today, last_message_date, referred_by) VALUES (?, ?, ?, 0, ?, ?)",
-        (user_id, username, now, datetime.now().date().isoformat(), referred_by)
-    )
-    # Если новый пользователь пришёл по реферальной ссылке — увеличиваем счётчик рефералов
-    if referred_by and c.lastrowid:
-        c.execute(
-            "UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?",
-            (referred_by,)
-        )
-        # Проверяем нужно ли давать бесплатный месяц (каждые 5 рефералов)
-        c.execute("SELECT referral_count FROM users WHERE user_id = ?", (referred_by,))
-        row = c.fetchone()
-        if row and row[0] % 5 == 0:
-            conn.commit()
-            conn.close()
-            # Даём бесплатный месяц рефереру
-            activate_subscription(referred_by)
-            return True  # сигнал что реферер получил награду
-    conn.commit()
-    conn.close()
+async def create_user(user_id: int, username: str, referred_by: int = None):
+    async with db_pool.acquire() as conn:
+        now = datetime.now().isoformat()
+        today = datetime.now().date().isoformat()
+        result = await conn.execute("""
+            INSERT INTO users (user_id, username, created_at, messages_today, last_message_date, referred_by)
+            VALUES ($1, $2, $3, 0, $4, $5)
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id, username, now, today, referred_by)
+
+        if result == "INSERT 0 1" and referred_by:
+            await conn.execute(
+                "UPDATE users SET referral_count = referral_count + 1 WHERE user_id = $1",
+                referred_by
+            )
+            row = await conn.fetchrow("SELECT referral_count FROM users WHERE user_id = $1", referred_by)
+            if row and row["referral_count"] % 5 == 0:
+                await activate_subscription(referred_by)
+                return True
     return False
 
 
-def get_referral_count(user_id: int) -> int:
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT referral_count FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
+async def get_referral_count(user_id: int) -> int:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT referral_count FROM users WHERE user_id = $1", user_id)
+        return row["referral_count"] if row else 0
 
 
-def get_user_style(user_id: int) -> str:
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT speech_style FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else "friend"
+async def get_user_style(user_id: int) -> str:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT speech_style FROM users WHERE user_id = $1", user_id)
+        return row["speech_style"] if row and row["speech_style"] else "friend"
 
 
-def set_user_style(user_id: int, style: str):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("UPDATE users SET speech_style = ? WHERE user_id = ?", (style, user_id))
-    conn.commit()
-    conn.close()
+async def set_user_style(user_id: int, style: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET speech_style = $1 WHERE user_id = $2", style, user_id)
 
 
-def activate_trial(user_id: int):
-    """Активируем пробный период 3 дня."""
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    trial_until = (datetime.now() + timedelta(days=TRIAL_DAYS)).isoformat()
-    c.execute(
-        "UPDATE users SET subscription_until = ?, trial_used = 1 WHERE user_id = ? AND trial_used = 0",
-        (trial_until, user_id)
-    )
-    affected = c.rowcount
-    conn.commit()
-    conn.close()
-    return affected > 0
+async def activate_trial(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        trial_until = (datetime.now() + timedelta(days=TRIAL_DAYS)).isoformat()
+        result = await conn.execute("""
+            UPDATE users SET subscription_until = $1, trial_used = 1
+            WHERE user_id = $2 AND trial_used = 0
+        """, trial_until, user_id)
+        return result == "UPDATE 1"
 
 
-def is_trial_used(user_id: int) -> bool:
-    user = get_user(user_id)
-    if not user:
-        return False
-    return bool(user.get("trial_used", 0))
-
-
-def claim_daily_bonus(user_id: int) -> bool:
-    """Даём ежедневный бонус +3 сообщения. Возвращает True если бонус выдан."""
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    today = datetime.now().date().isoformat()
-    c.execute("SELECT last_bonus_date, bonus_messages FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if not row or row[0] == today:
-        conn.close()
-        return False
-    current_bonus = row[1] or 0
-    if current_bonus >= MAX_BONUS_MESSAGES:
-        # Бонус накоплен до максимума — не добавляем
-        c.execute("UPDATE users SET last_bonus_date = ? WHERE user_id = ?", (today, user_id))
-        conn.commit()
-        conn.close()
-        return False
-    new_bonus = min(current_bonus + DAILY_BONUS_MESSAGES, MAX_BONUS_MESSAGES)
-    c.execute(
-        "UPDATE users SET bonus_messages = ?, last_bonus_date = ? WHERE user_id = ?",
-        (new_bonus, today, user_id)
-    )
-    conn.commit()
-    conn.close()
-    return True
-
-
-def get_users_expiring_soon() -> list:
-    """Пользователи чья подписка истекает через 3 дня."""
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    now = datetime.now()
-    in_3_days = (now + timedelta(days=3)).isoformat()
-    tomorrow = (now + timedelta(days=1)).isoformat()
-    c.execute("""
-        SELECT user_id, username, subscription_until FROM users
-        WHERE subscription_until BETWEEN ? AND ?
-        AND notified_expiry = 0
-    """, (tomorrow, in_3_days))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-def mark_notified(user_id: int):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("UPDATE users SET notified_expiry = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def reset_notified_expired():
-    """Сбрасываем флаг уведомления для истёкших подписок."""
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute("UPDATE users SET notified_expiry = 0 WHERE subscription_until < ?", (now,))
-    conn.commit()
-    conn.close()
-
-
-def is_subscribed(user_id: int) -> bool:
-    user = get_user(user_id)
-    if not user or not user["subscription_until"]:
+async def is_subscribed(user_id: int) -> bool:
+    user = await get_user(user_id)
+    if not user or not user.get("subscription_until"):
         return False
     until = datetime.fromisoformat(user["subscription_until"])
     return until > datetime.now()
 
 
-def get_subscription_until(user_id: int) -> str | None:
-    user = get_user(user_id)
-    if not user or not user["subscription_until"]:
+async def get_subscription_until(user_id: int) -> str | None:
+    user = await get_user(user_id)
+    if not user or not user.get("subscription_until"):
         return None
     until = datetime.fromisoformat(user["subscription_until"])
     if until > datetime.now():
@@ -498,32 +382,28 @@ def get_subscription_until(user_id: int) -> str | None:
     return None
 
 
-def activate_subscription(user_id: int):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    user = get_user(user_id)
-    if user and user["subscription_until"]:
-        current = datetime.fromisoformat(user["subscription_until"])
-        if current > datetime.now():
-            new_until = current + timedelta(days=SUBSCRIPTION_DAYS)
+async def activate_subscription(user_id: int):
+    async with db_pool.acquire() as conn:
+        user = await get_user(user_id)
+        if user and user.get("subscription_until"):
+            current = datetime.fromisoformat(user["subscription_until"])
+            if current > datetime.now():
+                new_until = current + timedelta(days=SUBSCRIPTION_DAYS)
+            else:
+                new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
         else:
             new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
-    else:
-        new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
-    c.execute(
-        "UPDATE users SET subscription_until = ? WHERE user_id = ?",
-        (new_until.isoformat(), user_id)
-    )
-    conn.commit()
-    conn.close()
+        await conn.execute(
+            "UPDATE users SET subscription_until = $1 WHERE user_id = $2",
+            new_until.isoformat(), user_id
+        )
 
 
-def can_send_message(user_id: int) -> tuple[bool, int]:
-    """Возвращает (может ли отправить, осталось сообщений)"""
-    if is_subscribed(user_id):
-        return True, -1  # -1 = безлимит
+async def can_send_message(user_id: int) -> tuple[bool, int]:
+    if await is_subscribed(user_id):
+        return True, -1
 
-    user = get_user(user_id)
+    user = await get_user(user_id)
     if not user:
         return False, 0
 
@@ -531,72 +411,119 @@ def can_send_message(user_id: int) -> tuple[bool, int]:
     bonus = user.get("bonus_messages", 0) or 0
     total_limit = FREE_MESSAGES_PER_DAY + bonus
 
-    if user["last_message_date"] != today:
-        conn = sqlite3.connect("bot.db")
-        c = conn.cursor()
-        c.execute(
-            "UPDATE users SET messages_today = 0, last_message_date = ? WHERE user_id = ?",
-            (today, user_id)
-        )
-        conn.commit()
-        conn.close()
+    if user.get("last_message_date") != today:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET messages_today = 0, last_message_date = $1 WHERE user_id = $2",
+                today, user_id
+            )
         return True, total_limit
 
-    remaining = total_limit - user["messages_today"]
+    remaining = total_limit - (user.get("messages_today") or 0)
     return remaining > 0, max(0, remaining)
 
 
-def increment_message_count(user_id: int):
+async def increment_message_count(user_id: int):
     today = datetime.now().date().isoformat()
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET messages_today = messages_today + 1, last_message_date = ? WHERE user_id = ?",
-        (today, user_id)
-    )
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET messages_today = messages_today + 1, last_message_date = $1 WHERE user_id = $2",
+            today, user_id
+        )
+
+
+async def claim_daily_bonus(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        today = datetime.now().date().isoformat()
+        row = await conn.fetchrow(
+            "SELECT last_bonus_date, bonus_messages FROM users WHERE user_id = $1", user_id
+        )
+        if not row or row["last_bonus_date"] == today:
+            return False
+        current_bonus = row["bonus_messages"] or 0
+        if current_bonus >= MAX_BONUS_MESSAGES:
+            await conn.execute(
+                "UPDATE users SET last_bonus_date = $1 WHERE user_id = $2", today, user_id
+            )
+            return False
+        new_bonus = min(current_bonus + DAILY_BONUS_MESSAGES, MAX_BONUS_MESSAGES)
+        await conn.execute(
+            "UPDATE users SET bonus_messages = $1, last_bonus_date = $2 WHERE user_id = $3",
+            new_bonus, today, user_id
+        )
+        return True
+
+
+async def get_users_expiring_soon() -> list:
+    async with db_pool.acquire() as conn:
+        now = datetime.now()
+        in_3_days = (now + timedelta(days=3)).isoformat()
+        tomorrow = (now + timedelta(days=1)).isoformat()
+        rows = await conn.fetch("""
+            SELECT user_id, username, subscription_until FROM users
+            WHERE subscription_until BETWEEN $1 AND $2
+            AND notified_expiry = 0
+        """, tomorrow, in_3_days)
+        return [(r["user_id"], r["username"], r["subscription_until"]) for r in rows]
+
+
+async def mark_notified(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET notified_expiry = 1 WHERE user_id = $1", user_id)
+
+
+async def reset_notified_expired():
+    async with db_pool.acquire() as conn:
+        now = datetime.now().isoformat()
+        await conn.execute(
+            "UPDATE users SET notified_expiry = 0 WHERE subscription_until < $1", now
+        )
+
+
+async def is_trial_used(user_id: int) -> bool:
+    user = await get_user(user_id)
+    if not user:
+        return False
+    return bool(user.get("trial_used", 0))
+
+
+async def save_payment(user_id: int, username: str, payment_id: str):
+    async with db_pool.acquire() as conn:
+        now = datetime.now().isoformat()
+        await conn.execute(
+            "INSERT INTO payments (user_id, username, amount, payment_id, created_at) VALUES ($1, $2, $3, $4, $5)",
+            user_id, username, SUBSCRIPTION_PRICE_RUB, payment_id, now
+        )
 
 
 # ─── История сообщений (персистентная) ───────────────────────────────────────
-def load_history(user_id: int) -> list[dict]:
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute(
-        "SELECT role, content FROM message_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, MAX_HISTORY)
-    )
-    rows = c.fetchall()
-    conn.close()
-    # Возвращаем в правильном порядке (старые сначала)
-    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
-
-
-def save_message(user_id: int, role: str, content: str):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    now = datetime.now().isoformat()
-    c.execute(
-        "INSERT INTO message_history (user_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, role, content if isinstance(content, str) else str(content), now)
-    )
-    # Удаляем старые сообщения, оставляем только MAX_HISTORY*2
-    c.execute("""
-        DELETE FROM message_history WHERE id IN (
-            SELECT id FROM message_history WHERE user_id = ?
-            ORDER BY id DESC LIMIT -1 OFFSET ?
+async def load_history(user_id: int) -> list[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, content FROM message_history WHERE user_id = $1 ORDER BY id DESC LIMIT $2",
+            user_id, MAX_HISTORY
         )
-    """, (user_id, MAX_HISTORY * 2))
-    conn.commit()
-    conn.close()
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
-def clear_history(user_id: int):
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM message_history WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+async def save_message(user_id: int, role: str, content: str):
+    async with db_pool.acquire() as conn:
+        now = datetime.now().isoformat()
+        await conn.execute(
+            "INSERT INTO message_history (user_id, role, content, created_at) VALUES ($1, $2, $3, $4)",
+            user_id, role, content if isinstance(content, str) else str(content), now
+        )
+        await conn.execute("""
+            DELETE FROM message_history WHERE id IN (
+                SELECT id FROM message_history WHERE user_id = $1
+                ORDER BY id DESC OFFSET $2
+            )
+        """, user_id, MAX_HISTORY * 2)
+
+
+async def clear_history(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM message_history WHERE user_id = $1", user_id)
 
 
 def bottom_menu() -> ReplyKeyboardMarkup:
@@ -889,22 +816,21 @@ def create_presentation(text: str) -> bytes | None:
 
 
 async def ask_claude(user_id: int, content) -> str:
-    history = load_history(user_id)
+    history = await load_history(user_id)
     content_str = content if isinstance(content, str) else "[фото]"
     history.append({"role": "user", "content": content})
 
     response = await anthropic.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=2048,
-        system=get_system_prompt(user_id),
+        system=await get_system_prompt(user_id),
         messages=history
     )
 
     reply = response.content[0].text
 
-    # Сохраняем в БД (только текстовые сообщения)
-    save_message(user_id, "user", content_str)
-    save_message(user_id, "assistant", reply)
+    await save_message(user_id, "user", content_str)
+    await save_message(user_id, "assistant", reply)
 
     return reply
 
@@ -926,14 +852,14 @@ async def cmd_start(message: Message):
         except ValueError:
             pass
 
-    reward = create_user(user_id, username, referred_by)
+    reward = await create_user(user_id, username, referred_by)
 
     # Активируем пробный период для новых пользователей
-    trial_activated = activate_trial(user_id)
+    trial_activated = await activate_trial(user_id)
 
     # Уведомляем реферера о новом приглашённом
     if referred_by:
-        ref_count = get_referral_count(referred_by)
+        ref_count = await get_referral_count(referred_by)
         remaining = 5 - (ref_count % 5)
         try:
             if reward:
@@ -951,7 +877,7 @@ async def cmd_start(message: Message):
         except Exception:
             pass
 
-    sub_until = get_subscription_until(user_id)
+    sub_until = await get_subscription_until(user_id)
     if trial_activated:
         sub_text = f"🎁 Пробный период активирован на {TRIAL_DAYS} дня — безлимитный доступ!"
     elif sub_until:
@@ -979,7 +905,7 @@ async def cmd_start(message: Message):
 @dp.message(Command("referral"))
 async def cmd_referral(message: Message):
     user_id = message.from_user.id
-    ref_count = get_referral_count(user_id)
+    ref_count = await get_referral_count(user_id)
     remaining = 5 - (ref_count % 5)
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
@@ -1002,8 +928,8 @@ async def check_expiring_subscriptions():
     """Каждые 12 часов проверяем истекающие подписки."""
     while True:
         try:
-            reset_notified_expired()
-            expiring = get_users_expiring_soon()
+            await reset_notified_expired()
+            expiring = await get_users_expiring_soon()
             for user_id, username, sub_until in expiring:
                 until_date = datetime.fromisoformat(sub_until).strftime("%d.%m.%Y")
                 try:
@@ -1013,7 +939,7 @@ async def check_expiring_subscriptions():
                         f"Продли подписку чтобы не потерять безлимитный доступ.",
                         reply_markup=subscription_keyboard()
                     )
-                    mark_notified(user_id)
+                    await mark_notified(user_id)
                     logger.info(f"Уведомление отправлено пользователю {user_id}")
                 except Exception as e:
                     logger.error(f"Ошибка отправки уведомления {user_id}: {e}")
@@ -1024,7 +950,7 @@ async def check_expiring_subscriptions():
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
-    clear_history(message.from_user.id)
+    await clear_history(message.from_user.id)
     await message.answer("🗑️ История очищена!")
 
 
@@ -1032,7 +958,7 @@ async def cmd_clear(message: Message):
 @dp.callback_query(F.data == "menu_subscribe")
 async def menu_subscribe(callback):
     await callback.answer()
-    sub_until = get_subscription_until(callback.from_user.id)
+    sub_until = await get_subscription_until(callback.from_user.id)
     extra = f"\nТвоя подписка будет продлена от {sub_until}." if sub_until else ""
     await callback.message.answer(
         f"💳 Подписка на NeuroBot\n\n"
@@ -1050,11 +976,11 @@ async def menu_subscribe(callback):
 async def menu_status(callback):
     await callback.answer()
     user_id = callback.from_user.id
-    sub_until = get_subscription_until(user_id)
+    sub_until = await get_subscription_until(user_id)
     if sub_until:
         await callback.message.answer(f"✅ Подписка активна до {sub_until}\n\nБез ограничений на сообщения!")
     else:
-        can, remaining = can_send_message(user_id)
+        can, remaining = await can_send_message(user_id)
         await callback.message.answer(
             f"🆓 Бесплатный план\n"
             f"Осталось сообщений сегодня: {remaining}/{FREE_MESSAGES_PER_DAY}\n\n"
@@ -1067,7 +993,7 @@ async def menu_status(callback):
 async def menu_referral(callback):
     await callback.answer()
     user_id = callback.from_user.id
-    ref_count = get_referral_count(user_id)
+    ref_count = await get_referral_count(user_id)
     remaining = 5 - (ref_count % 5)
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
@@ -1085,40 +1011,15 @@ async def menu_referral(callback):
 @dp.callback_query(F.data == "menu_clear")
 async def menu_clear(callback):
     await callback.answer()
-    clear_history(callback.from_user.id)
+    await clear_history(callback.from_user.id)
     await callback.message.answer("🗑️ История очищена!")
-
-
-@dp.callback_query(F.data == "menu_help")
-async def menu_help(callback):
-    await callback.answer()
-    await callback.message.answer(
-        "🤖 Примеры запросов:\n\n"
-        "🎨 Генерация картинки:\n"
-        "«Нарисуй закат над морем»\n\n"
-        "📊 Excel таблица:\n"
-        "«Создай таблицу с расходами за месяц»\n\n"
-        "📋 Презентация:\n"
-        "«Создай презентацию о космосе на 5 слайдов»\n\n"
-        "📝 Word документ:\n"
-        "«Напиши реферат о Второй мировой войне»\n"
-        "«Создай договор аренды»\n\n"
-        "🖼 Анализ картинки:\n"
-        "Просто отправь фото с подписью или без!\n\n"
-        "📐 Математика и задачи:\n"
-        "• Простые вычисления — точно ✅\n"
-        "• Уравнения и формулы — точно ✅\n"
-        "• Задачи с фото — хорошо, но проверяй сложные ⚠️\n"
-        "• Задачи с чертежами — старается, но может ошибиться ⚠️\n\n"
-        "💡 Если ответ неверный — напиши «неправильно» и пришли задачу заново!"
-    )
 
 
 @dp.callback_query(F.data == "menu_speech")
 async def menu_speech(callback):
     await callback.answer()
     user_id = callback.from_user.id
-    current_style = get_user_style(user_id)
+    current_style = await get_user_style(user_id)
     current_name = STYLE_NAMES.get(current_style, "😊 Как с другом")
     await callback.message.answer(
         f"🎙️ Настройки речи\n\n"
@@ -1134,7 +1035,7 @@ async def set_style(callback):
     style = callback.data.replace("style_", "")
     if style not in STYLE_PROMPTS:
         return
-    set_user_style(callback.from_user.id, style)
+    await set_user_style(callback.from_user.id, style)
     style_name = STYLE_NAMES.get(style, style)
     await callback.message.answer(
         f"✅ Стиль общения изменён на {style_name}!\n\n"
@@ -1145,12 +1046,12 @@ async def set_style(callback):
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     user_id = message.from_user.id
-    sub_until = get_subscription_until(user_id)
+    sub_until = await get_subscription_until(user_id)
 
     if sub_until:
         await message.answer(f"✅ Подписка активна до {sub_until}\n\nБез ограничений на сообщения!")
     else:
-        can, remaining = can_send_message(user_id)
+        can, remaining = await can_send_message(user_id)
         await message.answer(
             f"🆓 Бесплатный план\n"
             f"Осталось сообщений сегодня: {remaining}/{FREE_MESSAGES_PER_DAY}\n\n"
@@ -1161,7 +1062,7 @@ async def cmd_status(message: Message):
 
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
-    sub_until = get_subscription_until(message.from_user.id)
+    sub_until = await get_subscription_until(message.from_user.id)
     extra = f"\nТвоя подписка будет продлена до следующего месяца от {sub_until}." if sub_until else ""
 
     await message.answer(
@@ -1207,73 +1108,43 @@ async def cmd_admin(message: Message):
         await message.answer("❌ У тебя нет доступа к этой команде.")
         return
 
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
+    async with db_pool.acquire() as conn:
+        today = datetime.now().date().isoformat()
+        now = datetime.now().isoformat()
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+        month_start = datetime.now().replace(day=1).date().isoformat()
 
-    # Всего пользователей
-    c.execute("SELECT COUNT(*) FROM users")
-    total_users = c.fetchone()[0]
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        active_today = await conn.fetchval("SELECT COUNT(*) FROM users WHERE last_message_date = $1", today)
+        subscribers = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_until > $1", now)
+        new_week = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at > $1", week_ago)
 
-    # Активных сегодня
-    today = datetime.now().date().isoformat()
-    c.execute("SELECT COUNT(*) FROM users WHERE last_message_date = ?", (today,))
-    active_today = c.fetchone()[0]
+        top_users = await conn.fetch(
+            "SELECT username, messages_today FROM users ORDER BY messages_today DESC LIMIT 5"
+        )
+        sub_list = await conn.fetch(
+            "SELECT username, subscription_until FROM users WHERE subscription_until > $1 ORDER BY subscription_until DESC",
+            now
+        )
 
-    # Платящих подписчиков
-    now = datetime.now().isoformat()
-    c.execute("SELECT COUNT(*) FROM users WHERE subscription_until > ?", (now,))
-    subscribers = c.fetchone()[0]
+        rev_today = await conn.fetchrow(
+            "SELECT COUNT(*), SUM(amount) FROM payments WHERE created_at >= $1", today
+        )
+        rev_month = await conn.fetchrow(
+            "SELECT COUNT(*), SUM(amount) FROM payments WHERE created_at >= $1", month_start
+        )
+        rev_total = await conn.fetchrow("SELECT COUNT(*), SUM(amount) FROM payments")
 
-    # Новых пользователей за последние 7 дней
-    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-    c.execute("SELECT COUNT(*) FROM users WHERE created_at > ?", (week_ago,))
-    new_week = c.fetchone()[0]
+    revenue_today_count = rev_today[0] or 0
+    revenue_today = rev_today[1] or 0
+    revenue_month_count = rev_month[0] or 0
+    revenue_month = rev_month[1] or 0
+    revenue_total_count = rev_total[0] or 0
+    revenue_total = rev_total[1] or 0
 
-    # Топ 5 активных пользователей
-    c.execute("""
-        SELECT username, messages_today FROM users
-        ORDER BY messages_today DESC LIMIT 5
-    """)
-    top_users = c.fetchall()
-
-    # Подписчики — список
-    c.execute("""
-        SELECT username, subscription_until FROM users
-        WHERE subscription_until > ?
-        ORDER BY subscription_until DESC
-    """, (now,))
-    sub_list = c.fetchall()
-
-    # Выручка за сегодня
-    c.execute(
-        "SELECT COUNT(*), SUM(amount) FROM payments WHERE created_at >= ?",
-        (datetime.now().date().isoformat(),)
-    )
-    row = c.fetchone()
-    revenue_today_count = row[0] or 0
-    revenue_today = row[1] or 0
-
-    # Выручка за этот месяц
-    month_start = datetime.now().replace(day=1).date().isoformat()
-    c.execute(
-        "SELECT COUNT(*), SUM(amount) FROM payments WHERE created_at >= ?",
-        (month_start,)
-    )
-    row = c.fetchone()
-    revenue_month_count = row[0] or 0
-    revenue_month = row[1] or 0
-
-    # Всего выручки
-    c.execute("SELECT COUNT(*), SUM(amount) FROM payments")
-    row = c.fetchone()
-    revenue_total_count = row[0] or 0
-    revenue_total = row[1] or 0
-
-    conn.close()
-
-    top_text = "\n".join([f"  • {u[0] or 'unknown'} — {u[1]} сообщ." for u in top_users]) or "нет данных"
+    top_text = "\n".join([f"  • {u['username'] or 'unknown'} — {u['messages_today']} сообщ." for u in top_users]) or "нет данных"
     sub_text = "\n".join([
-        f"  • {u[0] or 'unknown'} до {datetime.fromisoformat(u[1]).strftime('%d.%m.%Y')}"
+        f"  • {u['username'] or 'unknown'} до {datetime.fromisoformat(u['subscription_until']).strftime('%d.%m.%Y')}"
         for u in sub_list
     ]) or "нет подписчиков"
 
@@ -1329,17 +1200,17 @@ async def check_limits(message: Message) -> bool:
     if message.from_user.id in ADMIN_IDS:
         return True  # админ без лимитов
     user_id = message.from_user.id
-    create_user(user_id, message.from_user.username or message.from_user.first_name)
+    await create_user(user_id, message.from_user.username or message.from_user.first_name)
 
     # Проверяем ежедневный бонус
-    if not is_subscribed(user_id):
-        bonus_given = claim_daily_bonus(user_id)
+    if not await is_subscribed(user_id):
+        bonus_given = await claim_daily_bonus(user_id)
         if bonus_given:
             await message.answer(
                 f"🎁 Ежедневный бонус! +{DAILY_BONUS_MESSAGES} сообщения сегодня за активность!"
             )
 
-    can, remaining = can_send_message(user_id)
+    can, remaining = await can_send_message(user_id)
 
     if not can:
         await message.answer(
@@ -1349,14 +1220,14 @@ async def check_limits(message: Message) -> bool:
         )
         return False
 
-    if not is_subscribed(user_id) and remaining <= 3:
+    if not await is_subscribed(user_id) and remaining <= 3:
         await message.answer(
             f"⚠️ Осталось {remaining} бесплатных сообщений на сегодня.",
             reply_markup=subscription_keyboard()
         )
 
-    if not is_subscribed(user_id):
-        increment_message_count(user_id)
+    if not await is_subscribed(user_id):
+        await increment_message_count(user_id)
 
     return True
 
@@ -1446,19 +1317,16 @@ async def cmd_broadcast(message: Message):
 
     await message.answer("📤 Начинаю рассылку...")
 
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users")
-    users = c.fetchall()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users")
 
     sent = 0
     failed = 0
-    for (user_id,) in users:
+    for row in users:
         try:
-            await bot.send_message(user_id, text)
+            await bot.send_message(row["user_id"], text)
             sent += 1
-            await asyncio.sleep(0.05)  # небольшая задержка чтобы не превысить лимиты
+            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
 
@@ -1611,7 +1479,7 @@ async def handle_text(message: Message):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 async def main():
-    init_db()
+    await init_db()
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info("Бот запускается...")
     asyncio.create_task(check_expiring_subscriptions())

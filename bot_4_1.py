@@ -1494,40 +1494,39 @@ def format_response(text: str) -> str:
     """
     import re
 
-    # Сначала вытаскиваем блоки кода и заменяем плейсхолдерами
+    # Сохраняем блоки ```код```
     code_blocks = []
     def save_code_block(match):
         lang = match.group(1) or ""
         code = match.group(2).strip()
-        placeholder = f"__CODE_BLOCK_{len(code_blocks)}__"
+        placeholder = f"CODEBLOCK{len(code_blocks)}END"
         code_blocks.append(f"```{lang}\n{code}\n```")
         return placeholder
 
-    # Сохраняем блоки ```код```
     text = re.sub(r"```(\w*)\n?(.*?)```", save_code_block, text, flags=re.DOTALL)
 
     # Сохраняем инлайн `код`
     inline_codes = []
     def save_inline_code(match):
         code = match.group(1)
-        placeholder = f"__INLINE_CODE_{len(inline_codes)}__"
+        placeholder = f"INLINECODE{len(inline_codes)}END"
         inline_codes.append(f"`{code}`")
         return placeholder
 
     text = re.sub(r"`([^`]+)`", save_inline_code, text)
 
     # Убираем лишний markdown из обычного текста
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)  # **жирный** → просто текст
-    text = re.sub(r"\*(.+?)\*", r"\1", text)        # *курсив* → просто текст
-    text = re.sub(r"__(.+?)__", r"\1", text)         # __текст__ → просто текст
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)  # # заголовки
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
 
     # Возвращаем блоки кода
     for i, block in enumerate(code_blocks):
-        text = text.replace(f"__CODE_BLOCK_{i}__", block)
+        text = text.replace(f"CODEBLOCK{i}END", block)
 
     for i, code in enumerate(inline_codes):
-        text = text.replace(f"__INLINE_CODE_{i}__", code)
+        text = text.replace(f"INLINECODE{i}END", code)
 
     return text.strip()
 

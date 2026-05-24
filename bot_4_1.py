@@ -729,10 +729,32 @@ def create_word(text: str) -> bytes | None:
 
 
 def is_math_request(text: str) -> bool:
-    keywords = ["вычисли", "посчитай", "сколько будет", "реши уравнение", "решить уравнение",
-                "найди корни", "интеграл", "производная", "логарифм", "sin", "cos", "sqrt",
-                "факториал", "calculate", "solve", "integral", "derivative", "=/", "^2", "^3"]
-    return any(kw in text.lower() for kw in keywords)
+    """Определяем запросы где нужно точное вычисление, а не объяснение."""
+    text_lower = text.lower()
+
+    # Исключаем теоретические вопросы
+    theory_keywords = ["что такое", "что значит", "объясни", "расскажи", "как работает",
+                       "зачем нужен", "для чего", "что означает", "определение"]
+    if any(kw in text_lower for kw in theory_keywords):
+        return False
+
+    # Только конкретные вычисления
+    calc_keywords = ["вычисли", "посчитай", "сколько будет", "реши уравнение",
+                     "решить уравнение", "найди корни", "calculate", "solve",
+                     "найди значение", "чему равно", "упрости", "разложи на множители"]
+    if any(kw in text_lower for kw in calc_keywords):
+        return True
+
+    # Математические выражения с числами
+    import re
+    if re.search(r"\d+\s*[\+\-\*\/\^]\s*\d+", text):
+        return True
+    if re.search(r"(sin|cos|tan|log|sqrt|∫)\s*[\(\d]", text_lower):
+        return True
+    if re.search(r"x\^?\d*\s*[\+\-\=]", text_lower):
+        return True
+
+    return False
 
 
 async def wolfram_calculate(query: str) -> str | None:

@@ -33,6 +33,7 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 WOLFRAM_API_KEY = os.getenv("WOLFRAM_API_KEY", "")
 YUKASSA_SHOP_ID = os.getenv("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET_KEY = os.getenv("YUKASSA_SECRET_KEY", "")
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
 
 # Цена подписки
 SUBSCRIPTION_PRICE_RUB = 299
@@ -715,30 +716,70 @@ async def wolfram_calculate(query: str) -> str | None:
     return None
 
 
-async def generate_image(prompt: str, retries: int = 3) -> bytes | None:
+async def _generate_together(prompt: str) -> bytes | None:
+    """Основной генератор — Together AI (FLUX)."""
+    if not TOGETHER_API_KEY:
+        return None
+    url = "https://api.together.xyz/v1/images/generations"
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "black-forest-labs/FLUX.1-schnell-Free",
+        "prompt": prompt,
+        "width": 1024,
+        "height": 1024,
+        "n": 1,
+        "response_format": "b64_json",
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, headers=headers, json=payload,
+                              timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    b64 = data["data"][0]["b64_json"]
+                    return base64.b64decode(b64)
+                else:
+                    body = await resp.text()
+                    logger.warning(f"Together: статус {resp.status}, {body[:200]}")
+    except Exception as e:
+        logger.error(f"Together ошибка: {type(e).__name__}: {e}")
+    return None
+
+
+async def _generate_pollinations(prompt: str) -> bytes | None:
+    """Запасной генератор — Pollinations."""
     encoded = urllib.parse.quote(prompt, safe='')
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    content_type = resp.headers.get("Content-Type", "")
+                    if data and content_type.startswith("image"):
+                        return data
+    except Exception as e:
+        logger.error(f"Pollinations ошибка: {type(e).__name__}: {e}")
+    return None
 
+
+async def generate_image(prompt: str, retries: int = 2) -> bytes | None:
+    """Пробует Together AI, при неудаче падает на Pollinations."""
     for attempt in range(1, retries + 1):
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        content_type = resp.headers.get("Content-Type", "")
-                        if data and content_type.startswith("image"):
-                            return data
-                        logger.warning(f"Попытка {attempt}: не картинка (Content-Type={content_type})")
-                    else:
-                        logger.warning(f"Попытка {attempt}: статус {resp.status}")
-        except asyncio.TimeoutError:
-            logger.warning(f"Попытка {attempt}: таймаут")
-        except Exception as e:
-            logger.error(f"Попытка {attempt}: {type(e).__name__}: {e}")
-
+        # Сначала Together AI
+        img = await _generate_together(prompt)
+        if img:
+            return img
+        # Затем Pollinations
+        img = await _generate_pollinations(prompt)
+        if img:
+            return img
+        logger.warning(f"Генерация: попытка {attempt} не удалась")
         if attempt < retries:
-            await asyncio.sleep(2 * attempt)
-
+            await asyncio.sleep(2)
     return None
 
 

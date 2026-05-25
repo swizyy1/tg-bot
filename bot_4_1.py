@@ -151,7 +151,7 @@ async def poll_payment(payment_id: str, user_id: int):
         await asyncio.sleep(30)
         paid = await check_yukassa_payment(payment_id)
         if paid:
-            await activate_subscription(user_id)
+            await activate_subscription(user_id, from_payment=True)
             until = await get_subscription_until(user_id)
             username = (await bot.get_chat(user_id)).username or str(user_id)
             await save_payment(user_id, username, payment_id)
@@ -403,16 +403,17 @@ async def get_subscription_until(user_id: int) -> str | None:
     return None
 
 
-async def activate_subscription(user_id: int):
+async def activate_subscription(user_id: int, from_payment: bool = False):
     async with db_pool.acquire() as conn:
         user = await get_user(user_id)
-        if user and user.get("subscription_until"):
+        if not from_payment and user and user.get("subscription_until"):
             current = datetime.fromisoformat(user["subscription_until"])
             if current > datetime.now():
                 new_until = current + timedelta(days=SUBSCRIPTION_DAYS)
             else:
                 new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
         else:
+            # При оплате всегда считаем от сегодня
             new_until = datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)
         await conn.execute(
             "UPDATE users SET subscription_until = $1 WHERE user_id = $2",
@@ -963,8 +964,50 @@ async def cmd_start(message: Message):
     await message.answer("Открываю меню:", reply_markup=main_keyboard())
 
 
-@dp.message(Command("referrals"))
-async def cmd_referrals(message: Message):
+@dp.message(Command("givesubscription"))
+async def cmd_give_subscription(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У тебя нет доступа к этой команде.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer(
+            "Использование: /givesubscription @username или /givesubscription user_id\n\n"
+            "Пример: /givesubscription @swizyy1"
+        )
+        return
+
+    target = args[1].replace("@", "")
+
+    async with db_pool.acquire() as conn:
+        # Ищем по username или user_id
+        if target.isdigit():
+            row = await conn.fetchrow("SELECT user_id, username FROM users WHERE user_id = $1", int(target))
+        else:
+            row = await conn.fetchrow("SELECT user_id, username FROM users WHERE username = $1", target)
+
+    if not row:
+        await message.answer(f"❌ Пользователь {target} не найден в базе.")
+        return
+
+    user_id = row["user_id"]
+    username = row["username"] or str(user_id)
+
+    await activate_subscription(user_id, from_payment=True)
+    until = await get_subscription_until(user_id)
+
+    await message.answer(f"✅ Подписка выдана @{username} до {until}!")
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎉 Тебе выдана подписка NeuroBot!\n\n"
+            f"✅ Подписка активна до {until}\n\n"
+            f"Безлимитный доступ ко всем функциям!"
+        )
+    except Exception:
+        pass
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ У тебя нет доступа к этой команде.")
         return

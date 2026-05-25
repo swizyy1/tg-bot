@@ -1267,8 +1267,7 @@ async def check_limits(message: Message) -> bool:
             reply_markup=subscription_keyboard()
         )
 
-    if not await is_subscribed(user_id):
-        await increment_message_count(user_id)
+    await increment_message_count(user_id)
 
     return True
 

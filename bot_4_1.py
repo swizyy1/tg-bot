@@ -331,10 +331,30 @@ async def create_user(user_id: int, username: str, referred_by: int = None):
                 "UPDATE users SET referral_count = referral_count + 1 WHERE user_id = $1",
                 referred_by
             )
-            row = await conn.fetchrow("SELECT referral_count FROM users WHERE user_id = $1", referred_by)
-            if row and row["referral_count"] % 5 == 0:
-                await activate_subscription(referred_by)
-                return True
+            row = await conn.fetchrow("SELECT referral_count, username FROM users WHERE user_id = $1", referred_by)
+            if row:
+                ref_count = row["referral_count"]
+                ref_username = row["username"] or str(referred_by)
+
+                # Уведомление админу когда кто-то достигает 10 рефералов
+                if ref_count == 10:
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"🏆 Победитель конкурса!\n\n"
+                                f"👤 @{ref_username} привёл 10 друзей!\n\n"
+                                f"Не забудь выдать приз:\n"
+                                f"• Месяц подписки\n"
+                                f"• Ранний доступ к голосовым"
+                            )
+                        except Exception:
+                            pass
+
+                # Каждые 5 рефералов — бесплатный месяц
+                if ref_count % 5 == 0:
+                    await activate_subscription(referred_by)
+                    return True
     return False
 
 

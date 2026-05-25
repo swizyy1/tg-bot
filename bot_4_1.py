@@ -963,8 +963,31 @@ async def cmd_start(message: Message):
     await message.answer("Открываю меню:", reply_markup=main_keyboard())
 
 
-@dp.message(Command("referral"))
-async def cmd_referral(message: Message):
+@dp.message(Command("referrals"))
+async def cmd_referrals(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У тебя нет доступа к этой команде.")
+        return
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT username, referral_count FROM users
+            WHERE referral_count > 0
+            ORDER BY referral_count DESC
+        """)
+
+    if not rows:
+        await message.answer("📊 Пока никто не привёл друзей.")
+        return
+
+    text = "📊 Рефералы:\n\n"
+    for row in rows:
+        username = row["username"] or "unknown"
+        count = row["referral_count"]
+        medal = "🏆" if count >= 10 else "🥈" if count >= 5 else "👤"
+        text += f"{medal} @{username} — {count} друзей\n"
+
+    await message.answer(text)
     user_id = message.from_user.id
     ref_count = await get_referral_count(user_id)
     remaining = 5 - (ref_count % 5)

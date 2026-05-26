@@ -34,6 +34,7 @@ WOLFRAM_API_KEY = os.getenv("WOLFRAM_API_KEY", "")
 YUKASSA_SHOP_ID = os.getenv("YUKASSA_SHOP_ID", "")
 YUKASSA_SECRET_KEY = os.getenv("YUKASSA_SECRET_KEY", "")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 # Цена подписки
 SUBSCRIPTION_PRICE_RUB = 299
@@ -737,7 +738,49 @@ async def wolfram_calculate(query: str) -> str | None:
     return None
 
 
-async def _generate_together(prompt: str) -> bytes | None:
+async def tavily_search(query: str) -> str | None:
+    """Поиск актуальной информации через Tavily."""
+    if not TAVILY_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": 3
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    if results:
+                        text = ""
+                        for r in results:
+                            text += f"• {r.get('title', '')}: {r.get('content', '')[:300]}\n\n"
+                        return text.strip()
+    except Exception as e:
+        logger.error(f"Tavily ошибка: {e}")
+    return None
+
+
+def is_search_request(text: str) -> bool:
+    """Определяем запросы где нужна актуальная информация."""
+    keywords = [
+        "последние новости", "новости", "сейчас", "сегодня", "вчера",
+        "в 2024", "в 2025", "в 2026", "актуально", "свежий", "недавно",
+        "последний", "текущий", "нынешний", "на данный момент",
+        "что происходит", "что случилось", "latest", "recent", "now", "today",
+        "current", "news", "знаешь ли", "слышал ли", "в курсе",
+        "нашли", "открыли", "обнаружили", "произошло", "случилось",
+        "вышел", "вышла", "вышло", "появился", "появилась", "появилось",
+        "объявили", "сообщили", "стало известно", "выяснилось",
+        "расскажи про последние", "что нового", "какие новости"
+    ]
+    return any(kw in text.lower() for kw in keywords)
     """Основной генератор — Together AI (FLUX)."""
     if not TOGETHER_API_KEY:
         return None
@@ -1601,6 +1644,19 @@ async def handle_text(message: Message):
                 )
                 reply = await ask_claude(user_id, enhanced_text)
                 await send_long_message(message, f"🔢 Точный ответ: {wolfram_result}\n\n{reply}")
+                return
+
+        # Поиск актуальной информации через Tavily
+        if is_search_request(text) and TAVILY_API_KEY:
+            search_result = await tavily_search(text)
+            if search_result:
+                enhanced_text = (
+                    f"{text}\n\n"
+                    f"[Актуальная информация из интернета:\n{search_result}]\n"
+                    f"Ответь на вопрос используя эту актуальную информацию."
+                )
+                reply = await ask_claude(user_id, enhanced_text)
+                await send_long_message(message, reply)
                 return
 
         reply = await ask_claude(user_id, text)

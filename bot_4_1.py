@@ -1008,6 +1008,10 @@ async def cmd_give_subscription(message: Message):
         )
     except Exception:
         pass
+
+
+@dp.message(Command("referrals"))
+async def cmd_referrals(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("❌ У тебя нет доступа к этой команде.")
         return
@@ -1031,6 +1035,10 @@ async def cmd_give_subscription(message: Message):
         text += f"{medal} @{username} — {count} друзей\n"
 
     await message.answer(text)
+
+
+@dp.message(Command("referral"))
+async def cmd_referral(message: Message):
     user_id = message.from_user.id
     ref_count = await get_referral_count(user_id)
     remaining = 5 - (ref_count % 5)

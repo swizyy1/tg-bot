@@ -293,7 +293,9 @@ async def init_db():
                 trial_used INTEGER DEFAULT 0,
                 bonus_messages INTEGER DEFAULT 0,
                 last_bonus_date TEXT,
-                speech_style TEXT DEFAULT 'friend'
+                speech_style TEXT DEFAULT 'friend',
+                images_today INTEGER DEFAULT 0,
+                last_image_date TEXT
             )
         """)
         await conn.execute("""
@@ -430,7 +432,34 @@ async def activate_subscription(user_id: int, from_payment: bool = False):
         )
 
 
-async def can_send_message(user_id: int) -> tuple[bool, int]:
+async def can_generate_image(user_id: int) -> tuple[bool, int]:
+    """Проверяем лимит картинок — 2 в день бесплатно."""
+    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+        return True, -1
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT images_today, last_image_date FROM users WHERE user_id = $1", user_id
+        )
+        if not row:
+            return False, 0
+        today = datetime.now().date().isoformat()
+        if row["last_image_date"] != today:
+            await conn.execute(
+                "UPDATE users SET images_today = 0, last_image_date = $1 WHERE user_id = $2",
+                today, user_id
+            )
+            return True, 2
+        remaining = 2 - (row["images_today"] or 0)
+        return remaining > 0, max(0, remaining)
+
+
+async def increment_image_count(user_id: int):
+    today = datetime.now().date().isoformat()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET images_today = images_today + 1, last_image_date = $1 WHERE user_id = $2",
+            today, user_id
+        )
     if await is_subscribed(user_id):
         return True, -1
 
@@ -1647,25 +1676,46 @@ async def handle_text(message: Message):
             )
             return
         if is_image_request(text):
+            can_img, img_remaining = await can_generate_image(user_id)
+            if not can_img:
+                await message.answer(
+                    "🎨 Бесплатный лимит картинок на сегодня исчерпан (2 шт.)\n\n"
+                    "С подпиской 299₽/месяц — генерируй картинки без ограничений!\n\n"
+                    "Или приведи 5 друзей и получи месяц бесплатно (/referral)",
+                    reply_markup=subscription_keyboard()
+                )
+                return
             await message.answer("🎨 Генерирую изображение, подожди 10-20 секунд...")
             await bot.send_chat_action(message.chat.id, "upload_photo")
             image_bytes = await generate_image(text)
             if image_bytes:
+                await increment_image_count(user_id)
+                caption = "✅ Готово!"
+                if not await is_subscribed(user_id) and img_remaining == 1:
+                    caption += f"\n\n⚠️ Это последняя бесплатная картинка на сегодня. Безлимит — по подписке!"
                 await message.answer_photo(
                     BufferedInputFile(image_bytes, filename="image.jpg"),
-                    caption="✅ Готово!"
+                    caption=caption
                 )
             else:
                 await message.answer("❌ Не удалось сгенерировать изображение. Попробуй ещё раз.")
             return
 
         if is_excel_request(text) or is_presentation_request(text) or is_word_request(text):
+            # Для бесплатных — ограничиваем объём через промпт
+            is_sub = await is_subscribed(user_id)
+            if not is_sub and user_id not in ADMIN_IDS:
+                if is_word_request(text):
+                    text = text + " (ВАЖНО: создай документ объёмом не более 1 страницы — около 250 слов)"
+                elif is_presentation_request(text):
+                    text = text + " (ВАЖНО: создай презентацию не более 3 слайдов)"
+
             reply = await ask_claude(user_id, text)
 
             if "EXCEL_TABLE:" in reply:
                 excel_bytes = create_excel(reply)
                 if excel_bytes:
-                    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+                    if is_sub or user_id in ADMIN_IDS:
                         await message.answer_document(
                             BufferedInputFile(excel_bytes, filename="таблица.xlsx"),
                             caption="📊 Вот твоя Excel таблица!"
@@ -1673,7 +1723,7 @@ async def handle_text(message: Message):
                     else:
                         await message.answer(
                             "📊 Таблица готова! Но скачать файл можно только по подписке.\n\n"
-                            "Вот предпросмотр:\n\n" + reply.replace("EXCEL_TABLE:", "").strip(),
+                            "Вот предпросмотр:\n\n" + reply.replace("EXCEL_TABLE:", "").strip()[:500] + "...",
                             reply_markup=subscription_keyboard()
                         )
                     return
@@ -1681,15 +1731,15 @@ async def handle_text(message: Message):
             if "PRESENTATION:" in reply:
                 pptx_bytes = create_presentation(reply)
                 if pptx_bytes:
-                    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+                    if is_sub or user_id in ADMIN_IDS:
                         await message.answer_document(
                             BufferedInputFile(pptx_bytes, filename="презентация.pptx"),
                             caption="📋 Вот твоя презентация!"
                         )
                     else:
                         await message.answer(
-                            "📋 Презентация готова! Но скачать файл можно только по подписке.\n\n"
-                            "Оформи подписку чтобы получить файл 👇",
+                            "📋 Готова презентация на 3 слайда — это бесплатная версия.\n\n"
+                            "С подпиской получишь полную презентацию на любое количество слайдов в виде файла 👇",
                             reply_markup=subscription_keyboard()
                         )
                     return
@@ -1697,17 +1747,21 @@ async def handle_text(message: Message):
             if is_word_request(text):
                 word_bytes = create_word(reply)
                 if word_bytes:
-                    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+                    if is_sub or user_id in ADMIN_IDS:
                         await message.answer_document(
                             BufferedInputFile(word_bytes, filename="документ.docx"),
                             caption="📝 Вот твой Word документ!"
                         )
                     else:
-                        await message.answer(
-                            "📝 Документ готов! Но скачать файл можно только по подписке.\n\n"
-                            "Оформи подписку чтобы получить файл 👇",
-                            reply_markup=subscription_keyboard()
-                        )
+                        # Добавляем водяной знак в текст
+                        watermarked_reply = reply + "\n\n---\n⚠️ Создано через NeuroBot (бесплатная версия — 1 стр.)\nПолная версия документа доступна по подписке 299₽/мес → @NeuroBot_official_bot"
+                        word_bytes_wm = create_word(watermarked_reply)
+                        if word_bytes_wm:
+                            await message.answer_document(
+                                BufferedInputFile(word_bytes_wm, filename="документ_preview.docx"),
+                                caption="📝 Вот превью документа (1 стр.)! Полная версия — по подписке 👇",
+                                reply_markup=subscription_keyboard()
+                            )
                     return
 
             await send_long_message(message, reply)

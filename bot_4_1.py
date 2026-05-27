@@ -781,6 +781,9 @@ def is_search_request(text: str) -> bool:
         "расскажи про последние", "что нового", "какие новости"
     ]
     return any(kw in text.lower() for kw in keywords)
+
+
+async def _generate_together(prompt: str) -> bytes | None:
     """Основной генератор — Together AI (FLUX)."""
     if not TOGETHER_API_KEY:
         return None

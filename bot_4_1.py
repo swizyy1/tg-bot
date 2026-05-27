@@ -40,7 +40,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 SUBSCRIPTION_PRICE_RUB = 299
 SUBSCRIPTION_PRICE_STARS = 250
 SUBSCRIPTION_DAYS = 30
-FREE_MESSAGES_PER_DAY = 10
+FREE_MESSAGES_PER_DAY = 5
 TRIAL_DAYS = 3
 DAILY_BONUS_MESSAGES = 3
 MAX_BONUS_MESSAGES = 15
@@ -1447,8 +1447,12 @@ async def check_limits(message: Message) -> bool:
 
     if not can:
         await message.answer(
-            f"⛔ Ты израсходовал лимит бесплатных сообщений на сегодня ({FREE_MESSAGES_PER_DAY} шт.)\n\n"
-            f"Лимит обновится завтра, или купи подписку для безлимитного доступа!",
+            f"⛔ Лимит на сегодня исчерпан ({FREE_MESSAGES_PER_DAY} сообщений).\n\n"
+            f"С подпиской 299₽/месяц:\n"
+            f"• Безлимитные сообщения\n"
+            f"• Скачивание файлов (Excel, Word, PowerPoint)\n"
+            f"• Генерация картинок без ограничений\n\n"
+            f"Или приведи 5 друзей и получи месяц бесплатно! (/referral)",
             reply_markup=subscription_keyboard()
         )
         return False
@@ -1661,28 +1665,49 @@ async def handle_text(message: Message):
             if "EXCEL_TABLE:" in reply:
                 excel_bytes = create_excel(reply)
                 if excel_bytes:
-                    await message.answer_document(
-                        BufferedInputFile(excel_bytes, filename="таблица.xlsx"),
-                        caption="📊 Вот твоя Excel таблица!"
-                    )
+                    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+                        await message.answer_document(
+                            BufferedInputFile(excel_bytes, filename="таблица.xlsx"),
+                            caption="📊 Вот твоя Excel таблица!"
+                        )
+                    else:
+                        await message.answer(
+                            "📊 Таблица готова! Но скачать файл можно только по подписке.\n\n"
+                            "Вот предпросмотр:\n\n" + reply.replace("EXCEL_TABLE:", "").strip(),
+                            reply_markup=subscription_keyboard()
+                        )
                     return
 
             if "PRESENTATION:" in reply:
                 pptx_bytes = create_presentation(reply)
                 if pptx_bytes:
-                    await message.answer_document(
-                        BufferedInputFile(pptx_bytes, filename="презентация.pptx"),
-                        caption="📋 Вот твоя презентация!"
-                    )
+                    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+                        await message.answer_document(
+                            BufferedInputFile(pptx_bytes, filename="презентация.pptx"),
+                            caption="📋 Вот твоя презентация!"
+                        )
+                    else:
+                        await message.answer(
+                            "📋 Презентация готова! Но скачать файл можно только по подписке.\n\n"
+                            "Оформи подписку чтобы получить файл 👇",
+                            reply_markup=subscription_keyboard()
+                        )
                     return
 
             if is_word_request(text):
                 word_bytes = create_word(reply)
                 if word_bytes:
-                    await message.answer_document(
-                        BufferedInputFile(word_bytes, filename="документ.docx"),
-                        caption="📝 Вот твой Word документ!"
-                    )
+                    if await is_subscribed(user_id) or user_id in ADMIN_IDS:
+                        await message.answer_document(
+                            BufferedInputFile(word_bytes, filename="документ.docx"),
+                            caption="📝 Вот твой Word документ!"
+                        )
+                    else:
+                        await message.answer(
+                            "📝 Документ готов! Но скачать файл можно только по подписке.\n\n"
+                            "Оформи подписку чтобы получить файл 👇",
+                            reply_markup=subscription_keyboard()
+                        )
                     return
 
             await send_long_message(message, reply)

@@ -1105,6 +1105,30 @@ async def cmd_referral(message: Message):
 
 
 # ─── Фоновая задача: уведомления об истечении подписки ───────────────────────
+async def check_expiring_subscriptions():
+    """Каждые 12 часов проверяем истекающие подписки."""
+    while True:
+        try:
+            await reset_notified_expired()
+            expiring = await get_users_expiring_soon()
+            for user_id, username, sub_until in expiring:
+                until_date = datetime.fromisoformat(sub_until).strftime("%d.%m.%Y")
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ Твоя подписка истекает {until_date}!\n\n"
+                        f"Продли подписку чтобы не потерять безлимитный доступ.",
+                        reply_markup=subscription_keyboard()
+                    )
+                    await mark_notified(user_id)
+                    logger.info(f"Уведомление отправлено пользователю {user_id}")
+                except Exception as e:
+                    logger.error(f"Ошибка отправки уведомления {user_id}: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка проверки подписок: {e}")
+        await asyncio.sleep(43200)  # 12 часов
+
+
 async def daily_reset_messages():
     """Каждую ночь в 00:00 UTC сбрасываем счётчик сообщений."""
     while True:

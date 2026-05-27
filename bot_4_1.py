@@ -1105,7 +1105,27 @@ async def cmd_referral(message: Message):
 
 
 # ─── Фоновая задача: уведомления об истечении подписки ───────────────────────
-async def check_expiring_subscriptions():
+async def daily_reset_messages():
+    """Каждую ночь в 00:00 UTC сбрасываем счётчик сообщений."""
+    while True:
+        now = datetime.now()
+        # Ждём до следующей полуночи UTC
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        wait_seconds = (next_midnight - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            async with db_pool.acquire() as conn:
+                today = datetime.now().date().isoformat()
+                await conn.execute(
+                    "UPDATE users SET messages_today = 0 WHERE last_message_date != $1",
+                    today
+                )
+            logger.info("Ежедневный сброс счётчиков выполнен")
+        except Exception as e:
+            logger.error(f"Ошибка сброса счётчиков: {e}")
     """Каждые 12 часов проверяем истекающие подписки."""
     while True:
         try:
@@ -1676,6 +1696,7 @@ async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
     logger.info("Бот запускается...")
     asyncio.create_task(check_expiring_subscriptions())
+    asyncio.create_task(daily_reset_messages())
     await dp.start_polling(bot)
 
 
